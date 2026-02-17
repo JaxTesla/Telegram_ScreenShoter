@@ -29,7 +29,7 @@ import win32con
 import win32api
 
 
-def load_settings(path: str = "settings.ini") -> Tuple[str, List[int]]:
+def load_settings(path: str = "settings.ini") -> Tuple[str, List[int], int]:
     """Загрузка настроек бота из файла settings.ini с поддержкой PyInstaller.
 
     Ищет файл в следующем порядке:
@@ -37,6 +37,7 @@ def load_settings(path: str = "settings.ini") -> Tuple[str, List[int]]:
     2) Рядом с исполняемым файлом (для onefile/onedir)
     3) В каталоге распаковки PyInstaller (_MEIPASS), если передан --add-data
     Ожидается секция [telegram] с ключами bot_token и allowed_users.
+    Секция [image] содержит max_size_kb — максимальный размер изображения в КБ.
     """
     config = configparser.ConfigParser()
 
@@ -83,7 +84,7 @@ def load_settings(path: str = "settings.ini") -> Tuple[str, List[int]]:
         print(f"❌ Файл settings.ini не найден. Искали в:")
         for cp in candidate_paths:
             print(f"   - {cp} (существует: {cp.is_file()})")
-        return "", []
+        return "", [], 150
 
     token = config.get("telegram", "bot_token", fallback="").strip()
     users_raw = config.get("telegram", "allowed_users", fallback="").strip()
@@ -100,7 +101,12 @@ def load_settings(path: str = "settings.ini") -> Tuple[str, List[int]]:
                 # Пропускаем некорректные значения
                 continue
 
-    return token, allowed_users
+    # Секция [image]
+    max_size_kb = config.getint("image", "max_size_kb", fallback=150)
+    if max_size_kb < 10:
+        max_size_kb = 150
+
+    return token, allowed_users, max_size_kb
 
 
 def get_virtual_screen_bounds() -> Tuple[int, int, int, int]:
@@ -381,11 +387,90 @@ async def capture_window_image(target_window: gw.Win32Window, retries: int = 3) 
     raise RuntimeError("Не удалось получить изображение окна")
 
 
+def compress_image_to_fit(img: Image.Image, max_size_kb: int) -> Tuple[bytes, str]:
+    """Сжимает изображение, чтобы влезть в заданный лимит в КБ.
+
+    Стратегия:
+    1) Пробуем JPEG с quality от 90 и ниже с шагом -10
+    2) Если при quality=20 всё ещё не влезает — уменьшаем размеры на 25% и повторяем
+    3) Повторяем масштабирование до 3 раз
+
+    Возвращает (bytes, extension) — сжатые данные и расширение файла ('jpg').
+    """
+    max_bytes = max_size_kb * 1024
+
+    # Убедимся что режим RGB (JPEG не поддерживает RGBA)
+    if img.mode in ("RGBA", "P", "LA"):
+        img = img.convert("RGB")
+
+    for scale_step in range(4):
+        for quality in range(90, 10, -10):
+            bio = BytesIO()
+            img.save(bio, format="JPEG", quality=quality, optimize=True)
+            data = bio.getvalue()
+            bio.close()
+            if len(data) <= max_bytes:
+                return data, "jpg"
+        # Уменьшаем размеры на 25%
+        new_w = int(img.width * 0.75)
+        new_h = int(img.height * 0.75)
+        if new_w < 100 or new_h < 100:
+            break
+        img = img.resize((new_w, new_h), Image.LANCZOS)
+
+    # Крайний случай — отдаём то, что получилось при минимальном quality
+    bio = BytesIO()
+    img.save(bio, format="JPEG", quality=15, optimize=True)
+    data = bio.getvalue()
+    bio.close()
+    return data, "jpg"
+
+
+async def send_photo_with_retry(
+    reply_func,
+    img: Image.Image,
+    max_size_kb: int,
+    caption: str,
+    filename_base: str,
+    max_retries: int = 3,
+) -> None:
+    """Отправляет фото в Telegram, при таймауте пробует сжать сильнее.
+
+    reply_func — awaitable callback (message.reply_photo или callback.message.reply_photo).
+    При каждом ретрае после таймаута лимит снижается на 20% для более агрессивного сжатия.
+    """
+    current_limit = max_size_kb
+    last_error = None
+
+    for attempt in range(1, max_retries + 1):
+        data, ext = compress_image_to_fit(img, current_limit)
+        filename = f"{filename_base}.{ext}"
+        photo_file = BufferedInputFile(data, filename=filename)
+        try:
+            await reply_func(photo=photo_file, caption=caption)
+            return
+        except Exception as e:
+            last_error = e
+            err_lower = str(e).lower()
+            is_timeout = ("timeout" in err_lower or "timed out" in err_lower
+                          or "connecttimeouterror" in err_lower
+                          or "readerror" in err_lower)
+            if not is_timeout:
+                raise
+            # Снижаем лимит на 20% для следующей попытки
+            current_limit = max(20, int(current_limit * 0.8))
+            await asyncio.sleep(1.5 * attempt)
+
+    if last_error:
+        raise last_error
+
+
 class ScreenshotBot:
-    def __init__(self, token: str, allowed_users: list = None):
+    def __init__(self, token: str, allowed_users: list = None, max_size_kb: int = 150):
         self.bot = Bot(token=token)
         self.dp = Dispatcher()
         self.allowed_users = allowed_users or []
+        self.max_size_kb = max_size_kb
         self.stop_event = asyncio.Event()
         self.window_index_map: Dict[Tuple[int, int], List[str]] = {}
 
@@ -430,31 +515,28 @@ class ScreenshotBot:
             await message.reply("У вас нет доступа к этому боту.")
             return
 
+        screenshot = None
         try:
             await message.reply("📸 Делаю скриншот экрана...")
 
-            # Делаем скриншот
             screenshot = pyautogui.screenshot()
 
-            # Конвертируем в BytesIO для отправки
-            bio = BytesIO()
-            screenshot.save(bio, format='PNG')
-            bio.seek(0)
-
-            # Создаем имя файла с временной меткой
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            filename = f"screenshot_{timestamp}.png"
+            filename_base = f"screenshot_{timestamp}"
+            caption = f"🖥️ Скриншот экрана\n🕐 {datetime.now().strftime('%H:%M:%S')}"
 
-            # Отправляем скриншот
-            screenshot_file = BufferedInputFile(
-                bio.getvalue(), filename=filename)
-            await message.reply_photo(
-                photo=screenshot_file,
-                caption=f"🖥️ Скриншот экрана\n🕐 {datetime.now().strftime('%H:%M:%S')}"
+            await send_photo_with_retry(
+                message.reply_photo,
+                screenshot,
+                self.max_size_kb,
+                caption,
+                filename_base,
             )
 
         except Exception as e:
             await message.reply(f"❌ Ошибка при создании скриншота: {str(e)}")
+        finally:
+            del screenshot
 
     async def window_screenshot(self, message: Message):
         """Команда /window - скриншот конкретного окна"""
@@ -499,27 +581,21 @@ class ScreenshotBot:
             # Захватываем изображение окна устойчивым способом (ретраи, кроп)
             screenshot = await capture_window_image(target_window, retries=3)
 
-            # Конвертируем в BytesIO
-            bio = BytesIO()
-            screenshot.save(bio, format='PNG')
-            bio.seek(0)
-
-            # Создаем имя файла
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             safe_name = "".join(
                 c for c in target_window.title if c.isalnum() or c in (' ', '-', '.'))[:20]
-            filename = f"window_{safe_name}_{timestamp}.png"
+            filename_base = f"window_{safe_name}_{timestamp}"
+            caption = f"🪟 Окно: {target_window.title}\n🕐 {datetime.now().strftime('%H:%M:%S')}"
 
-            # Отправляем скриншот
-            screenshot_file = BufferedInputFile(
-                bio.getvalue(), filename=filename)
-            await message.reply_photo(
-                photo=screenshot_file,
-                caption=f"🪟 Окно: {target_window.title}\n🕐 {datetime.now().strftime('%H:%M:%S')}"
+            await send_photo_with_retry(
+                message.reply_photo,
+                screenshot,
+                self.max_size_kb,
+                caption,
+                filename_base,
             )
 
         except Exception as e:
-            # Специальная подсказка для Windows-кода 258 (таймаут)
             err_text = str(e)
             hint = ""
             if "258" in err_text:
@@ -528,6 +604,9 @@ class ScreenshotBot:
                     "не запущено с другими привилегиями, и не перекрыто системными окнами. "
                     "Попробуйте развернуть окно на главный монитор."
                 )
+            err_lower = err_text.lower()
+            if "timeout" in err_lower or "timed out" in err_lower:
+                hint += "\n\n⏱️ Отправка не удалась после нескольких попыток сжатия. Попробуйте уменьшить max_size_kb в settings.ini."
             await message.reply(f"❌ Ошибка при создании скриншота окна: {err_text}{hint}")
 
     async def list_windows(self, message: Message):
@@ -618,20 +697,18 @@ class ScreenshotBot:
 
             screenshot = await capture_window_image(target_window, retries=3)
 
-            bio = BytesIO()
-            screenshot.save(bio, format='PNG')
-            bio.seek(0)
-
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             safe_name = "".join(
                 c for c in target_window.title if c.isalnum() or c in (' ', '-', '.'))[:20]
-            filename = f"window_{safe_name}_{timestamp}.png"
+            filename_base = f"window_{safe_name}_{timestamp}"
+            caption = f"🪟 Окно: {target_window.title}\n🕐 {datetime.now().strftime('%H:%M:%S')}"
 
-            screenshot_file = BufferedInputFile(
-                bio.getvalue(), filename=filename)
-            await callback.message.reply_photo(
-                photo=screenshot_file,
-                caption=f"🪟 Окно: {target_window.title}\n🕐 {datetime.now().strftime('%H:%M:%S')}"
+            await send_photo_with_retry(
+                callback.message.reply_photo,
+                screenshot,
+                self.max_size_kb,
+                caption,
+                filename_base,
             )
 
         except Exception as e:
@@ -643,6 +720,9 @@ class ScreenshotBot:
                     "не запущено с другими привилегиями, и не перекрыто системными окнами. "
                     "Попробуйте развернуть окно на главный монитор."
                 )
+            err_lower = err_text.lower()
+            if "timeout" in err_lower or "timed out" in err_lower:
+                hint += "\n\n⏱️ Отправка не удалась после нескольких попыток сжатия. Попробуйте уменьшить max_size_kb в settings.ini."
             with contextlib.suppress(Exception):
                 await callback.answer("Ошибка", show_alert=False)
             if callback.message:
@@ -734,14 +814,15 @@ class ScreenshotBot:
 # Функция для запуска бота
 async def main():
     # Загружаем настройки из settings.ini
-    BOT_TOKEN, ALLOWED_USERS = load_settings()
+    BOT_TOKEN, ALLOWED_USERS, MAX_SIZE_KB = load_settings()
 
     if not BOT_TOKEN:
         raise RuntimeError(
             "Не найден bot_token в settings.ini. Укажите токен в секции [telegram]."
         )
 
-    bot = ScreenshotBot(BOT_TOKEN, ALLOWED_USERS)
+    print(f"📦 Лимит размера изображений: {MAX_SIZE_KB} КБ")
+    bot = ScreenshotBot(BOT_TOKEN, ALLOWED_USERS, MAX_SIZE_KB)
     await bot.start_polling()
 
 
