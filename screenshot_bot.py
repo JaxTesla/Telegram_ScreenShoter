@@ -29,7 +29,7 @@ import win32con
 import win32api
 
 
-def load_settings(path: str = "settings.ini") -> Tuple[str, List[int], int]:
+def load_settings(path: str = "settings.ini") -> Tuple[str, List[int], Dict]:
     """Загрузка настроек бота из файла settings.ini с поддержкой PyInstaller.
 
     Ищет файл в следующем порядке:
@@ -37,7 +37,7 @@ def load_settings(path: str = "settings.ini") -> Tuple[str, List[int], int]:
     2) Рядом с исполняемым файлом (для onefile/onedir)
     3) В каталоге распаковки PyInstaller (_MEIPASS), если передан --add-data
     Ожидается секция [telegram] с ключами bot_token и allowed_users.
-    Секция [image] содержит max_size_kb — максимальный размер изображения в КБ.
+    Секция [image] содержит настройки сжатия изображений.
     """
     config = configparser.ConfigParser()
 
@@ -84,7 +84,7 @@ def load_settings(path: str = "settings.ini") -> Tuple[str, List[int], int]:
         print(f"❌ Файл settings.ini не найден. Искали в:")
         for cp in candidate_paths:
             print(f"   - {cp} (существует: {cp.is_file()})")
-        return "", [], 150
+        return "", [], {"max_size_kb": 0, "auto_reduce_quality": True}
 
     token = config.get("telegram", "bot_token", fallback="").strip()
     users_raw = config.get("telegram", "allowed_users", fallback="").strip()
@@ -102,11 +102,18 @@ def load_settings(path: str = "settings.ini") -> Tuple[str, List[int], int]:
                 continue
 
     # Секция [image]
-    max_size_kb = config.getint("image", "max_size_kb", fallback=150)
-    if max_size_kb < 10:
-        max_size_kb = 150
+    max_size_kb = config.getint("image", "max_size_kb", fallback=0)
+    if max_size_kb < 0:
+        max_size_kb = 0  # 0 = без ограничений
 
-    return token, allowed_users, max_size_kb
+    auto_reduce_quality = config.getboolean("image", "auto_reduce_quality", fallback=True)
+
+    image_settings = {
+        "max_size_kb": max_size_kb,
+        "auto_reduce_quality": auto_reduce_quality,
+    }
+
+    return token, allowed_users, image_settings
 
 
 def get_virtual_screen_bounds() -> Tuple[int, int, int, int]:
@@ -387,90 +394,130 @@ async def capture_window_image(target_window: gw.Win32Window, retries: int = 3) 
     raise RuntimeError("Не удалось получить изображение окна")
 
 
-def compress_image_to_fit(img: Image.Image, max_size_kb: int) -> Tuple[bytes, str]:
-    """Сжимает изображение, чтобы влезть в заданный лимит в КБ.
-
-    Стратегия:
-    1) Пробуем JPEG с quality от 90 и ниже с шагом -10
-    2) Если при quality=20 всё ещё не влезает — уменьшаем размеры на 25% и повторяем
-    3) Повторяем масштабирование до 3 раз
-
-    Возвращает (bytes, extension) — сжатые данные и расширение файла ('jpg').
-    """
-    max_bytes = max_size_kb * 1024
-
-    # Убедимся что режим RGB (JPEG не поддерживает RGBA)
-    if img.mode in ("RGBA", "P", "LA"):
-        img = img.convert("RGB")
-
-    for scale_step in range(4):
-        for quality in range(90, 10, -10):
-            bio = BytesIO()
-            img.save(bio, format="JPEG", quality=quality, optimize=True)
-            data = bio.getvalue()
-            bio.close()
-            if len(data) <= max_bytes:
-                return data, "jpg"
-        # Уменьшаем размеры на 25%
-        new_w = int(img.width * 0.75)
-        new_h = int(img.height * 0.75)
-        if new_w < 100 or new_h < 100:
-            break
-        img = img.resize((new_w, new_h), Image.LANCZOS)
-
-    # Крайний случай — отдаём то, что получилось при минимальном quality
+def _save_as_png(img: Image.Image) -> bytes:
+    """Сохраняет изображение в PNG с дефолтным сжатием. Возвращает bytes."""
     bio = BytesIO()
-    img.save(bio, format="JPEG", quality=15, optimize=True)
+    img.save(bio, format="PNG", optimize=True, compress_level=6)
     data = bio.getvalue()
     bio.close()
-    return data, "jpg"
+    return data
+
+
+def _save_as_jpeg(img: Image.Image, quality: int) -> bytes:
+    """Сохраняет изображение в JPEG с заданным quality. Возвращает bytes."""
+    work = img.convert("RGB") if img.mode in ("RGBA", "P", "LA") else img
+    bio = BytesIO()
+    work.save(bio, format="JPEG", quality=quality, optimize=True)
+    data = bio.getvalue()
+    bio.close()
+    return data
+
+
+# Каскад quality для JPEG при ретраях (от максимального к минимальному)
+_JPEG_QUALITY_CASCADE = [95, 80, 65, 50, 35, 20]
+
+
+def _is_send_timeout(e: Exception) -> bool:
+    """Проверяет, является ли исключение таймаутом отправки."""
+    err_lower = str(e).lower()
+    return ("timeout" in err_lower or "timed out" in err_lower
+            or "connecttimeouterror" in err_lower
+            or "readerror" in err_lower)
 
 
 async def send_photo_with_retry(
     reply_func,
     img: Image.Image,
-    max_size_kb: int,
+    image_settings: Dict,
     caption: str,
     filename_base: str,
-    max_retries: int = 3,
 ) -> None:
-    """Отправляет фото в Telegram, при таймауте пробует сжать сильнее.
+    """Отправляет фото в Telegram с каскадной деградацией качества.
 
-    reply_func — awaitable callback (message.reply_photo или callback.message.reply_photo).
-    При каждом ретрае после таймаута лимит снижается на 20% для более агрессивного сжатия.
+    Логика:
+    1) Готовим PNG (compress_level=6)
+    2) Если max_size_kb=0 или PNG <= max_size_kb — отправляем PNG
+    3) Если PNG > max_size_kb — сразу переходим к JPEG (не тратим время)
+    4) При таймауте, если auto_reduce_quality=true — каскад JPEG quality вниз + resize
+    5) Если auto_reduce_quality=false — при таймауте сразу выбрасываем ошибку
     """
-    current_limit = max_size_kb
-    last_error = None
+    max_size_kb = image_settings["max_size_kb"]
+    max_bytes = max_size_kb * 1024 if max_size_kb > 0 else 0  # 0 = без лимита
+    auto_reduce = image_settings["auto_reduce_quality"]
 
-    for attempt in range(1, max_retries + 1):
-        data, ext = compress_image_to_fit(img, current_limit)
-        filename = f"{filename_base}.{ext}"
-        photo_file = BufferedInputFile(data, filename=filename)
+    # Шаг 1: пробуем PNG
+    png_data = _save_as_png(img)
+    png_fits = (max_bytes == 0) or (len(png_data) <= max_bytes)
+
+    if png_fits:
+        photo_file = BufferedInputFile(png_data, filename=f"{filename_base}.png")
         try:
             await reply_func(photo=photo_file, caption=caption)
             return
         except Exception as e:
-            last_error = e
-            err_lower = str(e).lower()
-            is_timeout = ("timeout" in err_lower or "timed out" in err_lower
-                          or "connecttimeouterror" in err_lower
-                          or "readerror" in err_lower)
-            if not is_timeout:
+            if not _is_send_timeout(e):
                 raise
-            # Снижаем лимит на 20% для следующей попытки
-            current_limit = max(20, int(current_limit * 0.8))
-            await asyncio.sleep(1.5 * attempt)
+            if not auto_reduce:
+                raise
+            # PNG по размеру ок, но таймаут — переходим к JPEG каскаду
+            await asyncio.sleep(1.5)
+    # else: PNG слишком большой — сразу JPEG каскад
+
+    del png_data
+
+    if not auto_reduce:
+        # Каскад выключен, PNG не прошёл по размеру — пробуем JPEG один раз с max quality
+        data = _save_as_jpeg(img, 95)
+        photo_file = BufferedInputFile(data, filename=f"{filename_base}.jpg")
+        await reply_func(photo=photo_file, caption=caption)
+        return
+
+    # Шаг 2: каскад JPEG с деградацией quality + resize
+    work_img = img
+    last_error = None
+
+    for scale_step in range(4):  # до 3 resize
+        for quality in _JPEG_QUALITY_CASCADE:
+            data = _save_as_jpeg(work_img, quality)
+            # Предфильтр: если лимит задан и файл больше — пропускаем
+            if max_bytes > 0 and len(data) > max_bytes:
+                continue
+            photo_file = BufferedInputFile(data, filename=f"{filename_base}.jpg")
+            try:
+                await reply_func(photo=photo_file, caption=caption)
+                return
+            except Exception as e:
+                last_error = e
+                if not _is_send_timeout(e):
+                    raise
+                await asyncio.sleep(1.5)
+
+        # Все quality перебраны — уменьшаем разрешение
+        new_w = int(work_img.width * 0.75)
+        new_h = int(work_img.height * 0.75)
+        if new_w < 100 or new_h < 100:
+            break
+        work_img = work_img.resize((new_w, new_h), Image.LANCZOS)
+
+    # Крайний случай: минимальный quality после всех resize
+    data = _save_as_jpeg(work_img, 15)
+    photo_file = BufferedInputFile(data, filename=f"{filename_base}.jpg")
+    try:
+        await reply_func(photo=photo_file, caption=caption)
+        return
+    except Exception as e:
+        last_error = e
 
     if last_error:
         raise last_error
 
 
 class ScreenshotBot:
-    def __init__(self, token: str, allowed_users: list = None, max_size_kb: int = 150):
+    def __init__(self, token: str, allowed_users: list = None, image_settings: Dict = None):
         self.bot = Bot(token=token)
         self.dp = Dispatcher()
         self.allowed_users = allowed_users or []
-        self.max_size_kb = max_size_kb
+        self.image_settings = image_settings or {"max_size_kb": 0, "auto_reduce_quality": True}
         self.stop_event = asyncio.Event()
         self.window_index_map: Dict[Tuple[int, int], List[str]] = {}
 
@@ -528,7 +575,7 @@ class ScreenshotBot:
             await send_photo_with_retry(
                 message.reply_photo,
                 screenshot,
-                self.max_size_kb,
+                self.image_settings,
                 caption,
                 filename_base,
             )
@@ -590,7 +637,7 @@ class ScreenshotBot:
             await send_photo_with_retry(
                 message.reply_photo,
                 screenshot,
-                self.max_size_kb,
+                self.image_settings,
                 caption,
                 filename_base,
             )
@@ -706,7 +753,7 @@ class ScreenshotBot:
             await send_photo_with_retry(
                 callback.message.reply_photo,
                 screenshot,
-                self.max_size_kb,
+                self.image_settings,
                 caption,
                 filename_base,
             )
@@ -814,15 +861,17 @@ class ScreenshotBot:
 # Функция для запуска бота
 async def main():
     # Загружаем настройки из settings.ini
-    BOT_TOKEN, ALLOWED_USERS, MAX_SIZE_KB = load_settings()
+    BOT_TOKEN, ALLOWED_USERS, IMAGE_SETTINGS = load_settings()
 
     if not BOT_TOKEN:
         raise RuntimeError(
             "Не найден bot_token в settings.ini. Укажите токен в секции [telegram]."
         )
 
-    print(f"📦 Лимит размера изображений: {MAX_SIZE_KB} КБ")
-    bot = ScreenshotBot(BOT_TOKEN, ALLOWED_USERS, MAX_SIZE_KB)
+    limit_str = f"{IMAGE_SETTINGS['max_size_kb']} КБ" if IMAGE_SETTINGS['max_size_kb'] > 0 else "без ограничений"
+    reduce_str = "вкл" if IMAGE_SETTINGS["auto_reduce_quality"] else "выкл"
+    print(f"📦 Лимит: {limit_str} | Авто-сжатие: {reduce_str}")
+    bot = ScreenshotBot(BOT_TOKEN, ALLOWED_USERS, IMAGE_SETTINGS)
     await bot.start_polling()
 
 
