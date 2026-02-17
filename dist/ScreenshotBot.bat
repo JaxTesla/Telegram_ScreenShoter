@@ -1,0 +1,3 @@
+ScreenshotBot.exe
+
+pause

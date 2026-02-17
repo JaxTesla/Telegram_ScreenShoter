@@ -1,0 +1,7 @@
+settings.ini
+settings_.ini
+advanced_bot.py
+dist\ScreenshotBot.bat
+build\
+__pycache__\
+*.zip
