@@ -84,7 +84,7 @@ def load_settings(path: str = "settings.ini") -> Tuple[str, List[int], Dict]:
         print(f"❌ Файл settings.ini не найден. Искали в:")
         for cp in candidate_paths:
             print(f"   - {cp} (существует: {cp.is_file()})")
-        return "", [], {"max_size_kb": 0, "png_compress_level": 6, "auto_reduce_quality": True}
+        return "", [], {"max_size_kb": 0, "auto_reduce_quality": True}
 
     token = config.get("telegram", "bot_token", fallback="").strip()
     users_raw = config.get("telegram", "allowed_users", fallback="").strip()
@@ -106,14 +106,10 @@ def load_settings(path: str = "settings.ini") -> Tuple[str, List[int], Dict]:
     if max_size_kb < 0:
         max_size_kb = 0  # 0 = без ограничений
 
-    png_compress_level = config.getint("image", "png_compress_level", fallback=6)
-    png_compress_level = max(0, min(9, png_compress_level))
-
     auto_reduce_quality = config.getboolean("image", "auto_reduce_quality", fallback=True)
 
     image_settings = {
         "max_size_kb": max_size_kb,
-        "png_compress_level": png_compress_level,
         "auto_reduce_quality": auto_reduce_quality,
     }
 
@@ -398,10 +394,10 @@ async def capture_window_image(target_window: gw.Win32Window, retries: int = 3) 
     raise RuntimeError("Не удалось получить изображение окна")
 
 
-def _save_as_png(img: Image.Image, compress_level: int) -> bytes:
-    """Сохраняет изображение в PNG. Возвращает bytes."""
+def _save_as_png(img: Image.Image) -> bytes:
+    """Сохраняет изображение в PNG с дефолтным сжатием. Возвращает bytes."""
     bio = BytesIO()
-    img.save(bio, format="PNG", optimize=True, compress_level=compress_level)
+    img.save(bio, format="PNG", optimize=True, compress_level=6)
     data = bio.getvalue()
     bio.close()
     return data
@@ -439,7 +435,7 @@ async def send_photo_with_retry(
     """Отправляет фото в Telegram с каскадной деградацией качества.
 
     Логика:
-    1) Готовим PNG (compress_level из настроек)
+    1) Готовим PNG (compress_level=6)
     2) Если max_size_kb=0 или PNG <= max_size_kb — отправляем PNG
     3) Если PNG > max_size_kb — сразу переходим к JPEG (не тратим время)
     4) При таймауте, если auto_reduce_quality=true — каскад JPEG quality вниз + resize
@@ -447,11 +443,10 @@ async def send_photo_with_retry(
     """
     max_size_kb = image_settings["max_size_kb"]
     max_bytes = max_size_kb * 1024 if max_size_kb > 0 else 0  # 0 = без лимита
-    png_cl = image_settings["png_compress_level"]
     auto_reduce = image_settings["auto_reduce_quality"]
 
     # Шаг 1: пробуем PNG
-    png_data = _save_as_png(img, png_cl)
+    png_data = _save_as_png(img)
     png_fits = (max_bytes == 0) or (len(png_data) <= max_bytes)
 
     if png_fits:
@@ -522,7 +517,7 @@ class ScreenshotBot:
         self.bot = Bot(token=token)
         self.dp = Dispatcher()
         self.allowed_users = allowed_users or []
-        self.image_settings = image_settings or {"max_size_kb": 0, "png_compress_level": 6, "auto_reduce_quality": True}
+        self.image_settings = image_settings or {"max_size_kb": 0, "auto_reduce_quality": True}
         self.stop_event = asyncio.Event()
         self.window_index_map: Dict[Tuple[int, int], List[str]] = {}
 
@@ -875,7 +870,7 @@ async def main():
 
     limit_str = f"{IMAGE_SETTINGS['max_size_kb']} КБ" if IMAGE_SETTINGS['max_size_kb'] > 0 else "без ограничений"
     reduce_str = "вкл" if IMAGE_SETTINGS["auto_reduce_quality"] else "выкл"
-    print(f"📦 Лимит: {limit_str} | PNG compress_level: {IMAGE_SETTINGS['png_compress_level']} | Авто-сжатие: {reduce_str}")
+    print(f"📦 Лимит: {limit_str} | Авто-сжатие: {reduce_str}")
     bot = ScreenshotBot(BOT_TOKEN, ALLOWED_USERS, IMAGE_SETTINGS)
     await bot.start_polling()
 
